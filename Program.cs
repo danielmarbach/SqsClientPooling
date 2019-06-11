@@ -19,9 +19,9 @@ namespace SqsPooling
         static long receiveCount;
         static long sentCount;
 
-        static SemaphoreSlim maxConcurrencySemaphore = new SemaphoreSlim(100);
+        static SemaphoreSlim maxConcurrencySemaphore = new SemaphoreSlim(200);
 
-        static int numberOfMessages = 2000;
+        static int numberOfMessages = 20000;
         static CountdownEvent countDownEvent = new CountdownEvent(numberOfMessages);
 
         public static ConcurrentBag<StatsEntry> stats = new ConcurrentBag<StatsEntry>();
@@ -77,23 +77,23 @@ namespace SqsPooling
 
             Console.WriteLine("Queues purged.");
 
-            bool pooling = false;
+            bool pooling = true;
             var stopWatch = Stopwatch.StartNew();
             var cts = new CancellationTokenSource();
-            var consumerTasks = new List<Task>();
+            var receiveClients = new List<IAmazonSQS>();
 
+            await Sending(client, queueUrl, pooling);
+
+            var consumerTasks = new List<Task>();
             for (var i = 0; i < 10; i++)
             {
-                consumerTasks.Add(ConsumeMessage(client, queueUrl, i, cts.Token, pooling));
+                consumerTasks.Add(ConsumeMessage(client, receiveClients, queueUrl, i, cts.Token, pooling));
             }
 
             var waitEvent = Task.Run(() =>
             {
                 countDownEvent.Wait();
             });
-
-            await Sending(client, queueUrl, pooling: false);
-
             await waitEvent;
 
             stopWatch.Stop();
@@ -111,8 +111,13 @@ namespace SqsPooling
 
             cts?.Dispose();
             maxConcurrencySemaphore?.Dispose();
+            foreach (var receiveClient in receiveClients)
+            {
+                receiveClient.Dispose();
+            }
 
             Console.WriteLine("Press any key to exit.");
+            GC.Collect();
 
             await WriteStats();
 
@@ -127,42 +132,46 @@ namespace SqsPooling
             IAmazonSQS[] clientPool = null;
             if (pooling)
             {
-                clientPool = new IAmazonSQS[] { new AmazonSQSClient(new AmazonSQSConfig()), new AmazonSQSClient(new AmazonSQSConfig()) };
+                clientPool = new IAmazonSQS[] { new AmazonSQSClient(new AmazonSQSConfig()), new AmazonSQSClient(new AmazonSQSConfig()), new AmazonSQSClient(new AmazonSQSConfig()) };
             }
 
             try
             {
-                var sendTask = new List<Task>(numberOfMessages);
-                batchSend++;
-                for (var i = 0; i < numberOfMessages; i++)
+                for (var i = 0; i < numberOfMessages / 1000; i++)
                 {
-                    async Task SendMessage(long localAttempt, long batchNr)
+                    var sendTask = new List<Task>(1000);
+                    batchSend++;
+                    for (var j = 0; j < 1000; j++)
                     {
-                        var now = DateTimeOffset.UtcNow;
-
-                        try
+                        async Task SendMessage(long localAttempt, long batchNr)
                         {
-                            sent.AddOrUpdate(localAttempt, (now, batchNr), (_, __) => (now, batchNr));
+                            var now = DateTimeOffset.UtcNow;
 
-                            var client = pooling ? clientPool[localAttempt % 2] : sharedClient;
-                            await client.SendMessageAsync(new SendMessageRequest(queueUrl, $"{localAttempt};{now.ToUnixTimeMilliseconds()};{batchNr}"), CancellationToken.None);
-
-                            Interlocked.Increment(ref sentCount);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Sending error {ex.Message}. Aborting");
-                            if (!countDownEvent.IsSet)
+                            try
                             {
-                                countDownEvent.Signal();
+                                sent.AddOrUpdate(localAttempt, (now, batchNr), (_, __) => (now, batchNr));
+
+                                var client = pooling ? clientPool[localAttempt % clientPool.Length] : sharedClient;
+                                await client.SendMessageAsync(new SendMessageRequest(queueUrl, $"{localAttempt};{now.ToUnixTimeMilliseconds()};{batchNr}"), CancellationToken.None);
+
+                                Interlocked.Increment(ref sentCount);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Sending error {ex.Message}. Aborting");
+                                if (!countDownEvent.IsSet)
+                                {
+                                    countDownEvent.Signal();
+                                }
                             }
                         }
+
+                        sendTask.Add(SendMessage(attempt++, batchSend));
                     }
 
-                    sendTask.Add(SendMessage(attempt++, batchSend));
+                    await Task.WhenAll(sendTask);
                 }
 
-                await Task.WhenAll(sendTask);
             }
             catch (OperationCanceledException)
             {
@@ -189,12 +198,13 @@ namespace SqsPooling
             }
         }
 
-        static async Task ConsumeMessage(IAmazonSQS sharedClient, string queueUrl, int pumpNumber, CancellationToken token, bool pooling)
+        static async Task ConsumeMessage(IAmazonSQS sharedClient, List<IAmazonSQS> createdClients, string queueUrl, int pumpNumber, CancellationToken token, bool pooling)
         {
             IAmazonSQS client = sharedClient;
             if (pooling)
             {
                 client = new AmazonSQSClient(new AmazonSQSConfig());
+                createdClients.Add(client);
             }
             while (!token.IsCancellationRequested)
             {
@@ -240,10 +250,6 @@ namespace SqsPooling
                 {
                     Console.WriteLine($"{DateTime.UtcNow} ({pumpNumber}) - error");
                 }
-            }
-            if (pooling)
-            {
-                client.Dispose();
             }
         }
 
